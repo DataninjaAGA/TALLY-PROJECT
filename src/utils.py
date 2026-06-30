@@ -13,6 +13,24 @@ except Exception:  # pragma: no cover
 AIRCRAFT_RE = re.compile(r"^(?:N\d{2,5}[A-Z]{1,3}|[A-Z]{2}-[A-Z0-9]{3,4})$")
 
 
+MONTH_ABBR = {
+    "JAN": 1,
+    "FEB": 2,
+    "MAR": 3,
+    "APR": 4,
+    "MAY": 5,
+    "JUN": 6,
+    "JUL": 7,
+    "AUG": 8,
+    "SEP": 9,
+    "OCT": 10,
+    "NOV": 11,
+    "DEC": 12,
+}
+
+MONTH_DAY_RE = re.compile(r"\b(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*([0-3]?\d)\b", re.IGNORECASE)
+
+
 def clean_text(value: Any) -> str:
     """Normalize values read from Excel without destroying meaningful words."""
     if value is None:
@@ -96,19 +114,14 @@ def should_exclude_task(done_value: Any, include_cancelled: bool = False) -> boo
     excluded_tokens = ("CANCELLED", "CANCELED", "CLOSED")
     return any(token in done for token in excluded_tokens)
 
-MONTH_ABBR = {
-    "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
-    "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12,
-}
-
 
 def extract_month_day_from_text(value: Any) -> tuple[int, int] | None:
     """Extract dates like 'JUN 19' or 'JUN19' from a WO cell."""
     text = one_line(value).upper()
-    match = re.search(r"\b(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s*([0-3]?\d)\b", text)
+    match = MONTH_DAY_RE.search(text)
     if not match:
         return None
-    month = MONTH_ABBR[match.group(1)]
+    month = MONTH_ABBR[match.group(1).upper()]
     day = int(match.group(2))
     return month, day
 
@@ -124,3 +137,20 @@ def wo_date_matches_tally_date(wo_text: Any, tally_date: date | None) -> bool:
         return True
     month, day = month_day
     return month == tally_date.month and day == tally_date.day
+
+
+def clean_work_order_for_tally(value: Any) -> str:
+    """Return the WO value as it should be printed in the tally.
+
+    The Daily Check may store WOs as '367251 JUN 19' or '367251\nJUN 19'.
+    The date portion is useful for deciding whether the row belongs to the tally
+    date, but the official tally PDF should print only the WO number.
+    """
+    text = one_line(value)
+    if not text:
+        return ""
+
+    # Remove month/day tokens anywhere in the cell. Keep the actual WO number.
+    text = MONTH_DAY_RE.sub("", text)
+    text = re.sub(r"\s+", " ", text).strip(" -_/|,;")
+    return text.strip()
