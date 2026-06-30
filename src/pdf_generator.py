@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Iterable
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import landscape, letter
-from reportlab.pdfgen import canvas
 from reportlab.pdfbase.pdfmetrics import stringWidth
+from reportlab.pdfgen import canvas
 
 from .models import TallyDocument, TallyTask
 from .utils import format_short_date, one_line
@@ -20,12 +21,34 @@ FONT_BOLD = "Helvetica-Bold"
 FONT_OBLIQUE = "Helvetica-Oblique"
 LIGHT_BLUE = colors.Color(0.74, 0.84, 0.95)
 
+# Main layout constants. The tally is intentionally kept on one page.
+LEFT_X = 52
+RIGHT_X = 505
+TABLE_TOP_Y = 455
+HEADER_H = 14
+LEFT_WIDTHS = [54, 86, 210, 46, 40]
+RIGHT_WIDTHS = [65, 80, 120]
+MIN_TABLE_BOTTOM_Y = 150
+MIN_FONT_SIZE = 4.8
+MAX_FONT_SIZE = 7.4
+SIGNATURE_LINE_GAP = 44
+
+
+@dataclass(frozen=True)
+class RowLayout:
+    row_heights: list[float]
+    font_size: float
+    line_height: float
+
 
 class TallyPDFGenerator:
-    """Draws the Tally Sheet directly with ReportLab.
+    """Draws one official-looking Tally Sheet directly with ReportLab.
 
-    The coordinates intentionally mirror the provided PDFs: landscape Letter, two
-    side-by-side tables, signature area and copy block.
+    Important business rules implemented here:
+    - One register produces one PDF page only.
+    - Up to 14 task cards are compressed to fit in the same page.
+    - Signature lines are placed lower than the label text to leave signing room.
+    - The Volaris logo is loaded from assets/logo.png when available.
     """
 
     def __init__(self, logo_path: str | None = None):
@@ -34,69 +57,82 @@ class TallyPDFGenerator:
     def build_pdf(self, document: TallyDocument) -> bytes:
         buffer = BytesIO()
         c = canvas.Canvas(buffer, pagesize=PAGE_SIZE)
-
-        pages = self._paginate_tasks(document.tasks)
-        total_pages = len(pages)
-        for index, page_tasks in enumerate(pages, start=1):
-            self._draw_page(c, document, page_tasks, page_no=index, total_pages=total_pages)
-            c.showPage()
-
+        c.setTitle(document.filename)
+        self._draw_page(c, document)
         c.save()
         return buffer.getvalue()
 
-    def _paginate_tasks(self, tasks: list[TallyTask]) -> list[list[TallyTask]]:
-        pages: list[list[TallyTask]] = []
-        current: list[TallyTask] = []
-        current_height = 0
-        max_height = 315
-        for task in tasks:
-            height = self._row_height(task)
-            if current and current_height + height > max_height:
-                pages.append(current)
-                current = []
-                current_height = 0
-            current.append(task)
-            current_height += height
-        if current:
-            pages.append(current)
-        return pages or [[]]
-
-    def _row_height(self, task: TallyTask) -> int:
-        desc_lines = self._wrap_text(task.description, 205, FONT, 7.4)
-        task_lines = self._wrap_text(task.task_card, 72, FONT, 7.4)
-        remark_lines = self._wrap_text(task.remark, 104, FONT, 7.4)
-        line_count = max(len(desc_lines), len(task_lines), len(remark_lines), 1)
-        return max(17, int(line_count * 8.6 + 10))
-
-    def _draw_page(
-        self,
-        c: canvas.Canvas,
-        document: TallyDocument,
-        tasks: list[TallyTask],
-        page_no: int,
-        total_pages: int,
-    ) -> None:
-        c.setTitle(document.filename)
+    def _draw_page(self, c: canvas.Canvas, document: TallyDocument) -> None:
+        tasks = document.tasks[:14]
         self._draw_header(c, document)
 
-        left_x = 52
-        right_x = 505
-        table_top_y = 455
-        left_widths = [54, 86, 210, 46, 40]
-        right_widths = [65, 80, 120]
+        layout = self._calculate_row_layout(tasks)
+        self._draw_left_table(document.register, c, tasks, layout, LEFT_X, TABLE_TOP_Y, LEFT_WIDTHS)
+        self._draw_right_table(c, tasks, layout, RIGHT_X, TABLE_TOP_Y, RIGHT_WIDTHS)
 
-        row_heights = [self._row_height(task) for task in tasks]
-        self._draw_left_table(c, document.register, tasks, row_heights, left_x, table_top_y, left_widths)
-        self._draw_right_table(c, tasks, row_heights, right_x, table_top_y, right_widths)
+        bottom_y = TABLE_TOP_Y - HEADER_H - sum(layout.row_heights)
+        self._draw_signature_and_footer(c, bottom_y)
 
-        bottom_y = table_top_y - 14 - sum(row_heights)
-        self._draw_signature_and_footer(c, bottom_y, page_no, total_pages)
+    def _calculate_row_layout(self, tasks: list[TallyTask]) -> RowLayout:
+        """Calculate compact row heights so all tasks fit on one page.
+
+        The first pass tries progressively smaller fonts. If a very dense tally
+        still exceeds the available body height, the final pass proportionally
+        compresses row heights while preserving at least one readable line.
+        """
+        if not tasks:
+            return RowLayout(row_heights=[], font_size=MAX_FONT_SIZE, line_height=8.6)
+
+        max_body_h = TABLE_TOP_Y - HEADER_H - MIN_TABLE_BOTTOM_Y
+        font_candidates = [7.4, 7.0, 6.6, 6.2, 5.8, 5.4, 5.0, MIN_FONT_SIZE]
+
+        best_heights: list[float] = []
+        best_font_size = MIN_FONT_SIZE
+        best_line_h = MIN_FONT_SIZE + 1.1
+
+        for font_size in font_candidates:
+            line_h = font_size + 1.2
+            heights = [self._row_height(task, font_size, line_h) for task in tasks]
+            best_heights = heights
+            best_font_size = font_size
+            best_line_h = line_h
+            if sum(heights) <= max_body_h:
+                return RowLayout(row_heights=heights, font_size=font_size, line_height=line_h)
+
+        total_h = sum(best_heights)
+        if total_h > max_body_h and total_h > 0:
+            factor = max_body_h / total_h
+            min_h = best_line_h + 5
+            compressed = [max(min_h, h * factor) for h in best_heights]
+            # If the minimum height pushed us over the limit, distribute evenly.
+            if sum(compressed) > max_body_h:
+                even_h = max_body_h / len(tasks)
+                compressed = [even_h for _ in tasks]
+            best_heights = compressed
+
+        return RowLayout(row_heights=best_heights, font_size=best_font_size, line_height=best_line_h)
+
+    def _row_height(self, task: TallyTask, font_size: float, line_h: float) -> float:
+        desc_lines = self._wrap_text(task.description, 205, FONT, font_size)
+        task_lines = self._wrap_text(task.task_card, 72, FONT, font_size)
+        remark_lines = self._wrap_text(task.remark, 104, FONT, font_size)
+        wo_lines = self._wrap_text(one_line(task.work_order), 36, FONT, font_size)
+        line_count = max(len(desc_lines), len(task_lines), len(remark_lines), len(wo_lines), 1)
+        return max(14, line_count * line_h + 7)
 
     def _draw_header(self, c: canvas.Canvas, document: TallyDocument) -> None:
-        # Logo placeholder. Replace assets/logo.png to use a real logo.
         if self.logo_path and self.logo_path.exists():
             try:
-                c.drawImage(str(self.logo_path), 62, 495, width=95, height=32, mask="auto", preserveAspectRatio=True)
+                c.drawImage(
+                    str(self.logo_path),
+                    62,
+                    493,
+                    width=108,
+                    height=50,
+                    mask="auto",
+                    preserveAspectRatio=True,
+                    anchor="sw",
+                )
             except Exception:
                 self._draw_text_logo(c)
         else:
@@ -126,103 +162,174 @@ class TallyPDFGenerator:
 
     def _draw_left_table(
         self,
-        c: canvas.Canvas,
         register: str,
+        c: canvas.Canvas,
         tasks: list[TallyTask],
-        row_heights: list[int],
+        layout: RowLayout,
         x: int,
         top_y: int,
         widths: list[int],
     ) -> None:
-        header_h = 14
         total_w = sum(widths)
-        body_h = sum(row_heights)
+        body_h = sum(layout.row_heights)
         y = top_y
 
         c.setFont(FONT_OBLIQUE, 8.5)
         c.drawCentredString(x + widths[0] + (total_w - widths[0]) / 2, y + 5, "MAINTENANCE ACTIVITY")
 
-        # Header row
         headers = ["REGISTER", "TASK CARD", "DESCRIPTION", "M/H", "WO"]
         c.setFont(FONT_BOLD, 8)
         cx = x
         for width, header in zip(widths, headers):
-            c.rect(cx, y - header_h, width, header_h, stroke=1, fill=0)
+            c.rect(cx, y - HEADER_H, width, HEADER_H, stroke=1, fill=0)
             c.drawCentredString(cx + width / 2, y - 10, header)
             cx += width
 
-        body_top = y - header_h
+        body_top = y - HEADER_H
         body_bottom = body_top - body_h
 
-        # Register merged cell
         c.rect(x, body_bottom, widths[0], body_h, stroke=1, fill=0)
         c.setFont(FONT, 8)
         c.drawCentredString(x + widths[0] / 2, body_bottom + body_h / 2 - 3, register)
 
         y_cursor = body_top
-        for task, height in zip(tasks, row_heights):
+        for task, height in zip(tasks, layout.row_heights):
             y_next = y_cursor - height
             cx = x + widths[0]
-            # Task card
+
             c.rect(cx, y_next, widths[1], height, stroke=1, fill=0)
-            self._draw_wrapped(c, task.task_card, cx + 3, y_next, widths[1] - 6, height, align="center")
+            self._draw_wrapped(
+                c,
+                task.task_card,
+                cx + 3,
+                y_next,
+                widths[1] - 6,
+                height,
+                font_size=layout.font_size,
+                line_h=layout.line_height,
+                align="center",
+            )
             cx += widths[1]
-            # Description
+
             c.rect(cx, y_next, widths[2], height, stroke=1, fill=0)
-            self._draw_wrapped(c, task.description, cx + 3, y_next, widths[2] - 6, height, align="left")
+            self._draw_wrapped(
+                c,
+                task.description,
+                cx + 3,
+                y_next,
+                widths[2] - 6,
+                height,
+                font_size=layout.font_size,
+                line_h=layout.line_height,
+                align="left",
+            )
             cx += widths[2]
-            # M/H
+
             c.rect(cx, y_next, widths[3], height, stroke=1, fill=0)
-            self._draw_wrapped(c, task.man_hours, cx + 3, y_next, widths[3] - 6, height, align="center")
+            self._draw_wrapped(
+                c,
+                task.man_hours,
+                cx + 3,
+                y_next,
+                widths[3] - 6,
+                height,
+                font_size=layout.font_size,
+                line_h=layout.line_height,
+                align="center",
+            )
             cx += widths[3]
-            # WO
+
             c.rect(cx, y_next, widths[4], height, stroke=1, fill=0)
-            self._draw_wrapped(c, one_line(task.work_order), cx + 2, y_next, widths[4] - 4, height, align="center")
+            self._draw_wrapped(
+                c,
+                one_line(task.work_order),
+                cx + 2,
+                y_next,
+                widths[4] - 4,
+                height,
+                font_size=layout.font_size,
+                line_h=layout.line_height,
+                align="center",
+            )
             y_cursor = y_next
 
     def _draw_right_table(
         self,
         c: canvas.Canvas,
         tasks: list[TallyTask],
-        row_heights: list[int],
+        layout: RowLayout,
         x: int,
         top_y: int,
         widths: list[int],
     ) -> None:
-        header_h = 14
         headers = ["STATUS", "LOGBOOK PG.", "REMARK"]
         c.setFont(FONT_BOLD, 8)
         cx = x
         for width, header in zip(widths, headers):
-            c.rect(cx, top_y - header_h, width, header_h, stroke=1, fill=0)
+            c.rect(cx, top_y - HEADER_H, width, HEADER_H, stroke=1, fill=0)
             c.drawCentredString(cx + width / 2, top_y - 10, header)
             cx += width
 
-        y_cursor = top_y - header_h
-        for task, height in zip(tasks, row_heights):
+        y_cursor = top_y - HEADER_H
+        for task, height in zip(tasks, layout.row_heights):
             y_next = y_cursor - height
             cx = x
+
             c.rect(cx, y_next, widths[0], height, stroke=1, fill=0)
-            self._draw_wrapped(c, task.status, cx + 3, y_next, widths[0] - 6, height, align="center")
+            self._draw_wrapped(
+                c,
+                task.status,
+                cx + 3,
+                y_next,
+                widths[0] - 6,
+                height,
+                font_size=layout.font_size,
+                line_h=layout.line_height,
+                align="center",
+            )
             cx += widths[0]
+
             c.rect(cx, y_next, widths[1], height, stroke=1, fill=0)
-            self._draw_wrapped(c, task.logbook_pg, cx + 3, y_next, widths[1] - 6, height, align="center")
+            self._draw_wrapped(
+                c,
+                task.logbook_pg,
+                cx + 3,
+                y_next,
+                widths[1] - 6,
+                height,
+                font_size=layout.font_size,
+                line_h=layout.line_height,
+                align="center",
+            )
             cx += widths[1]
+
             c.rect(cx, y_next, widths[2], height, stroke=1, fill=0)
-            self._draw_wrapped(c, task.remark, cx + 3, y_next, widths[2] - 6, height, align="center")
+            self._draw_wrapped(
+                c,
+                task.remark,
+                cx + 3,
+                y_next,
+                widths[2] - 6,
+                height,
+                font_size=layout.font_size,
+                line_h=layout.line_height,
+                align="center",
+            )
             y_cursor = y_next
 
-    def _draw_signature_and_footer(self, c: canvas.Canvas, table_bottom_y: float, page_no: int, total_pages: int) -> None:
-        sig_y = max(72, table_bottom_y - 24)
-        c.setFont(FONT, 8)
-        c.drawString(112, table_bottom_y - 9, "PLANNING, CONTROL AND RECORDS")
-        c.drawString(112, table_bottom_y - 19, "ENGINNER")
-        c.line(95, sig_y, 443, sig_y)
-        c.drawCentredString(269, sig_y - 12, "NAME AND SIGNATURE")
+    def _draw_signature_and_footer(self, c: canvas.Canvas, table_bottom_y: float) -> None:
+        left_label_y = table_bottom_y - 9
+        line_y = max(88, table_bottom_y - SIGNATURE_LINE_GAP)
 
-        c.drawCentredString(616, table_bottom_y - 9, "MAINTENANCE SUPERVISOR ON DUTY")
-        c.line(505, sig_y, 702, sig_y)
-        c.drawCentredString(604, sig_y - 12, "NAME AND SIGNATURE")
+        c.setFont(FONT, 8)
+        c.drawString(112, left_label_y, "PLANNING, CONTROL AND RECORDS")
+        c.drawString(112, left_label_y - 10, "ENGINNER")
+        c.line(95, line_y, 443, line_y)
+        c.drawCentredString(269, line_y - 12, "NAME AND SIGNATURE")
+
+        c.drawCentredString(616, left_label_y, "MAINTENANCE SUPERVISOR ON DUTY")
+        c.line(505, line_y, 702, line_y)
+        c.drawCentredString(604, line_y - 12, "NAME AND SIGNATURE")
 
         c.drawString(55, 72, "Copy to:")
         c.drawString(55, 61, "Maintenance Control Center")
@@ -231,8 +338,6 @@ class TallyPDFGenerator:
 
         c.drawRightString(754, 48, "VOI-THS-126")
         c.drawRightString(754, 37, "REV. 1 21 ENE 2013")
-        if total_pages > 1:
-            c.drawRightString(754, 25, f"Page {page_no} of {total_pages}")
 
     def _wrap_text(self, text: str, width: float, font_name: str, font_size: float) -> list[str]:
         if not text:
@@ -251,6 +356,7 @@ class TallyPDFGenerator:
                 else:
                     if line:
                         final_lines.append(line)
+                    # Long single tokens are kept as-is; they are usually task-card IDs.
                     line = word
             if line:
                 final_lines.append(line)
@@ -264,13 +370,13 @@ class TallyPDFGenerator:
         y_bottom: float,
         width: float,
         height: float,
+        font_size: float,
+        line_h: float,
         align: str = "left",
     ) -> None:
-        font_size = 7.4
-        line_h = 8.6
         lines = self._wrap_text(text, width, FONT, font_size)
         block_h = len(lines) * line_h
-        y = y_bottom + max((height - block_h) / 2, 2) + block_h - line_h
+        y = y_bottom + max((height - block_h) / 2, 1.5) + block_h - line_h
         c.setFont(FONT, font_size)
         for line in lines:
             if y < y_bottom + 1:
