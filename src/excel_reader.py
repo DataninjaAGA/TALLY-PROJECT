@@ -17,6 +17,7 @@ from .utils import (
     one_line,
     should_exclude_task,
     wo_date_matches_tally_date,
+    clean_work_order_for_tally,
 )
 
 # Canonical columns in the Daily Check sheet after the header row is found.
@@ -213,7 +214,7 @@ def parse_daily_check(
                 task_card=task_card,
                 description=description,
                 man_hours=man_hours,
-                work_order=current_wo or wo_cell,
+                work_order=clean_work_order_for_tally(current_wo or wo_cell),
                 status="",
                 logbook_pg="",
                 remark=remark,
