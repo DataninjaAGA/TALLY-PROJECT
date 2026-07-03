@@ -33,6 +33,16 @@ MIN_FONT_SIZE = 4.8
 MAX_FONT_SIZE = 7.4
 SIGNATURE_LINE_GAP = 44
 
+# Vertical centering controls.
+# All coordinates are PDF points, with origin at the bottom-left.
+# The objective is not to center against the full sheet, because the footer
+# remains fixed at the bottom. Instead, the operational body is centered in the
+# usable middle area of the page.
+CONTENT_TOP_Y = 543          # Top of the logo/header block in the original layout.
+CONTENT_MAX_TOP_Y = 568      # Avoid pushing the logo too close to the top edge.
+CONTENT_MIN_BOTTOM_Y = 92    # Avoid colliding with the fixed footer.
+TARGET_BODY_CENTER_Y = 350   # Visual center of the main tally body area.
+
 
 @dataclass(frozen=True)
 class RowLayout:
@@ -49,6 +59,7 @@ class TallyPDFGenerator:
     - Up to 14 task cards are compressed to fit in the same page.
     - Signature lines are placed lower than the label text to leave signing room.
     - The Volaris logo is loaded from assets/logo.png when available.
+    - The main tally body is vertically centered according to the number of tasks.
     """
 
     def __init__(self, logo_path: str | None = None):
@@ -64,14 +75,44 @@ class TallyPDFGenerator:
 
     def _draw_page(self, c: canvas.Canvas, document: TallyDocument) -> None:
         tasks = document.tasks[:14]
-        self._draw_header(c, document)
-
         layout = self._calculate_row_layout(tasks)
-        self._draw_left_table(document.register, c, tasks, layout, LEFT_X, TABLE_TOP_Y, LEFT_WIDTHS)
-        self._draw_right_table(c, tasks, layout, RIGHT_X, TABLE_TOP_Y, RIGHT_WIDTHS)
 
-        bottom_y = TABLE_TOP_Y - HEADER_H - sum(layout.row_heights)
+        y_offset = self._calculate_vertical_offset(layout)
+        table_top_y = TABLE_TOP_Y + y_offset
+
+        self._draw_header(c, document, y_offset=y_offset)
+        self._draw_left_table(document.register, c, tasks, layout, LEFT_X, table_top_y, LEFT_WIDTHS)
+        self._draw_right_table(c, tasks, layout, RIGHT_X, table_top_y, RIGHT_WIDTHS)
+
+        bottom_y = table_top_y - HEADER_H - sum(layout.row_heights)
         self._draw_signature_and_footer(c, bottom_y)
+
+    def _calculate_vertical_offset(self, layout: RowLayout) -> float:
+        """Return the vertical movement needed to center the main tally body.
+
+        Previous versions used a fixed TABLE_TOP_Y. That made short tallys stay
+        glued to the upper half of the page. This function calculates the real
+        height of the generated body and shifts the header/table/signature block
+        so its visual center remains stable. The fixed footer is not moved.
+        """
+        body_h = sum(layout.row_heights)
+        table_bottom_y = TABLE_TOP_Y - HEADER_H - body_h
+
+        # This mirrors _draw_signature_and_footer() so the centering calculation
+        # uses the actual lowest point of the movable body.
+        line_y = max(88, table_bottom_y - SIGNATURE_LINE_GAP)
+        content_bottom_y = line_y - 16
+
+        current_center_y = (CONTENT_TOP_Y + content_bottom_y) / 2
+        y_offset = TARGET_BODY_CENTER_Y - current_center_y
+
+        # Safety limits: keep the movable body between page top and fixed footer.
+        if CONTENT_TOP_Y + y_offset > CONTENT_MAX_TOP_Y:
+            y_offset = CONTENT_MAX_TOP_Y - CONTENT_TOP_Y
+        if content_bottom_y + y_offset < CONTENT_MIN_BOTTOM_Y:
+            y_offset = CONTENT_MIN_BOTTOM_Y - content_bottom_y
+
+        return y_offset
 
     def _calculate_row_layout(self, tasks: list[TallyTask]) -> RowLayout:
         """Calculate compact row heights so all tasks fit on one page.
@@ -120,13 +161,13 @@ class TallyPDFGenerator:
         line_count = max(len(desc_lines), len(task_lines), len(remark_lines), len(wo_lines), 1)
         return max(14, line_count * line_h + 7)
 
-    def _draw_header(self, c: canvas.Canvas, document: TallyDocument) -> None:
+    def _draw_header(self, c: canvas.Canvas, document: TallyDocument, y_offset: float = 0) -> None:
         if self.logo_path and self.logo_path.exists():
             try:
                 c.drawImage(
                     str(self.logo_path),
                     62,
-                    493,
+                    493 + y_offset,
                     width=108,
                     height=50,
                     mask="auto",
@@ -134,31 +175,31 @@ class TallyPDFGenerator:
                     anchor="sw",
                 )
             except Exception:
-                self._draw_text_logo(c)
+                self._draw_text_logo(c, y_offset=y_offset)
         else:
-            self._draw_text_logo(c)
+            self._draw_text_logo(c, y_offset=y_offset)
 
         c.setFont(FONT_BOLD, 10)
-        c.drawCentredString(PAGE_W / 2, 502, "TALLY SHEET")
+        c.drawCentredString(PAGE_W / 2, 502 + y_offset, "TALLY SHEET")
 
         c.setFont(FONT_BOLD, 8.5)
-        c.drawString(520, 515, "STA")
+        c.drawString(520, 515 + y_offset, "STA")
         c.setFillColor(LIGHT_BLUE)
-        c.rect(558, 509, 82, 12, fill=1, stroke=0)
+        c.rect(558, 509 + y_offset, 82, 12, fill=1, stroke=0)
         c.setFillColor(colors.black)
-        c.drawCentredString(599, 512, document.station or "")
+        c.drawCentredString(599, 512 + y_offset, document.station or "")
 
-        c.drawString(612, 482, "DATE:")
+        c.drawString(612, 482 + y_offset, "DATE:")
         c.setFillColor(LIGHT_BLUE)
-        c.rect(642, 476, 112, 12, fill=1, stroke=0)
+        c.rect(642, 476 + y_offset, 112, 12, fill=1, stroke=0)
         c.setFillColor(colors.black)
-        c.drawString(646, 479, format_short_date(document.tally_date))
+        c.drawString(646, 479 + y_offset, format_short_date(document.tally_date))
 
-    def _draw_text_logo(self, c: canvas.Canvas) -> None:
+    def _draw_text_logo(self, c: canvas.Canvas, y_offset: float = 0) -> None:
         c.setFont(FONT_BOLD, 15)
-        c.drawString(67, 492, "volaris")
+        c.drawString(67, 492 + y_offset, "volaris")
         c.setFont(FONT_BOLD, 14)
-        c.drawString(121, 506, "+")
+        c.drawString(121, 506 + y_offset, "+")
 
     def _draw_left_table(
         self,
@@ -167,7 +208,7 @@ class TallyPDFGenerator:
         tasks: list[TallyTask],
         layout: RowLayout,
         x: int,
-        top_y: int,
+        top_y: float,
         widths: list[int],
     ) -> None:
         total_w = sum(widths)
@@ -259,7 +300,7 @@ class TallyPDFGenerator:
         tasks: list[TallyTask],
         layout: RowLayout,
         x: int,
-        top_y: int,
+        top_y: float,
         widths: list[int],
     ) -> None:
         headers = ["STATUS", "LOGBOOK PG.", "REMARK"]
